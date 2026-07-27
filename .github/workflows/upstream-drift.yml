@@ -1,0 +1,69 @@
+name: upstream-drift
+
+# Weekly, read-only drift heartbeat for spruce-labs forks vs their Pioreactor upstreams.
+# Reports only — never writes to the forks. Acting on drift (sync + merge on release
+# cadence) is manual by design. Add forks to the FORKS list below as they're created.
+
+on:
+  schedule:
+    - cron: "17 13 * * 1" # Mondays 13:17 UTC (~09:17 ET); off-the-hour per GH guidance
+  workflow_dispatch: {}
+
+permissions:
+  issues: write # to upsert the single "Upstream drift" tracking issue in THIS repo
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Compute drift and upsert tracking issue
+        run: |
+          set -euo pipefail
+
+          # "upstreamOwner/repo:branch  ourOrg:branch"  (our fork repo name == upstream repo name)
+          FORKS=(
+            "Pioreactor/pioreactor:master  spruce-labs:master"
+            "Pioreactor/CustoPiZer:pioreactor  spruce-labs:pioreactor"
+          )
+
+          {
+            echo "## Upstream drift — $(date -u +%Y-%m-%dT%H:%MZ)"
+            echo
+            echo "| upstream | behind (we're behind) | ahead (our patches) | latest upstream release |"
+            echo "|---|---|---|---|"
+          } > body.md
+
+          for entry in "${FORKS[@]}"; do
+            up="${entry%% *}"; ours="${entry##* }"
+            uprepo="${up%%:*}"; upbranch="${up##*:}"
+            ourowner="${ours%%:*}"; ourbranch="${ours##*:}"
+            reponame="${uprepo##*/}"
+
+            if ! gh api "repos/${ourowner}/${reponame}" >/dev/null 2>&1; then
+              echo "| ${uprepo} | _fork not created yet_ |  |  |" >> body.md
+              continue
+            fi
+
+            cmp=$(gh api "repos/${uprepo}/compare/${upbranch}...${ourowner}:${ourbranch}" 2>/dev/null || echo '{}')
+            behind=$(echo "$cmp" | jq -r '.behind_by // "?"')
+            ahead=$(echo "$cmp"  | jq -r '.ahead_by  // "?"')
+            rel=$(gh api "repos/${uprepo}/releases/latest" 2>/dev/null | jq -r '.tag_name // "—"')
+            echo "| ${uprepo} | ${behind} | ${ahead} | ${rel} |" >> body.md
+          done
+
+          echo >> body.md
+          echo "_Read-only heartbeat. Act on new upstream **releases**: sync the fork's mirror and merge on release cadence._" >> body.md
+
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+
+          num=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title \
+                --jq '[.[] | select(.title=="Upstream drift") | .number][0]' 2>/dev/null || echo "")
+          [ "$num" = "null" ] && num=""
+          if [ -n "$num" ]; then
+            gh issue edit "$num" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Upstream drift" --body-file body.md
+          fi
